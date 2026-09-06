@@ -26,6 +26,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   var sleepID: Int = 0 // sleep event ID
   var avServiceRetryID: Int = 0 // generation counter for scheduled AVService re-matching attempts
   let avServiceRetryDelays: [Double] = [2, 3, 5, 8, 12] // seconds between attempts, about 30 seconds in total
+  var mediaKeyTapWatchdogTimer: Timer?
+  let mediaKeyTapWatchdogInterval: TimeInterval = 60 // periodic re-registration of the key tap, see MediaKeyTapManager.refreshMediaKeyTapIfIdle
+  var mediaKeyTapRefreshID: Int = 0 // generation counter for one-off key tap refreshes after wake and reconfiguration
   var safeMode = false
   var jobRunning = false
   var startupActionWriteCounter: Int = 0
@@ -68,6 +71,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     self.configure(firstrun: true)
     DisplayManager.shared.createGammaActivityEnforcer()
     self.updaterController.startUpdater()
+    self.startMediaKeyTapWatchdog()
+  }
+
+  // MARK: - Media key tap watchdog
+
+  private func startMediaKeyTapWatchdog() {
+    self.mediaKeyTapWatchdogTimer?.invalidate()
+    let timer = Timer(timeInterval: self.mediaKeyTapWatchdogInterval, repeats: true) { [weak self] _ in
+      self?.mediaKeyTapWatchdogTick()
+    }
+    timer.tolerance = self.mediaKeyTapWatchdogInterval / 10
+    RunLoop.main.add(timer, forMode: .common)
+    self.mediaKeyTapWatchdogTimer = timer
+  }
+
+  private func mediaKeyTapWatchdogTick() {
+    guard self.sleepID == 0, self.reconfigureID == 0 else {
+      return
+    }
+    self.mediaKeyTap.refreshMediaKeyTapIfIdle()
+  }
+
+  // Other processes tend to (re)register their own key handling a few seconds after a display change or wake, which would
+  // put them in front of our tap. Refresh the tap once more shortly after such events.
+  private func scheduleMediaKeyTapRefresh(after delays: [Double] = [5, 20]) {
+    self.mediaKeyTapRefreshID += 1
+    let dispatchedRefreshID = self.mediaKeyTapRefreshID
+    for delay in delays {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        guard dispatchedRefreshID == self.mediaKeyTapRefreshID, self.sleepID == 0, self.reconfigureID == 0 else {
+          return
+        }
+        self.mediaKeyTap.refreshMediaKeyTapIfIdle()
+      }
+    }
   }
 
   @objc func quitClicked(_: AnyObject) {
@@ -159,6 +197,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     displaysPrefsVc?.loadDisplayList()
     self.job(start: true)
+    self.scheduleMediaKeyTapRefresh()
   }
 
   func updateMenusAndKeys() {
@@ -227,6 +266,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
       self.startupActionWriteRepeatAfterSober()
       self.updateMediaKeyTap()
+      self.scheduleMediaKeyTapRefresh()
     }
   }
 

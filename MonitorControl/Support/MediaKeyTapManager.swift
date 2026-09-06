@@ -9,10 +9,18 @@ import os.log
 class MediaKeyTapManager: MediaKeyTapDelegate {
   var mediaKeyTap: MediaKeyTap?
   var keyRepeatTimers: [MediaKey: Timer] = [:]
+  var lastMediaKeyEventTime: CFTimeInterval = 0 // used by the tap watchdog to avoid re-registering the tap while keys are in use
+  var watchedKeys: [MediaKey] = [] // the keys the current tap was started with
 
   func handle(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) {
     let isPressed = event?.keyPressed ?? true
     let isRepeat = event?.keyRepeat ?? false
+    self.lastMediaKeyEventTime = CACurrentMediaTime()
+    if isPressed, !isRepeat {
+      // Logged at default level on purpose: info level messages are not persisted on recent macOS versions, and this line
+      // is what tells us whether a key press reached the app at all when a user reports "the keys do nothing".
+      os_log("Media key %{public}@ received (sleepID %{public}@, reconfigureID %{public}@)", type: .default, String(describing: mediaKey), String(app.sleepID), String(app.reconfigureID))
+    }
     let isControl = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.control])) ?? false
     let isCommand = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.command])) ?? false
     let isOption = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.option])) ?? false
@@ -72,10 +80,37 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
     self.sendDisplayCommandBrightnessContrast(mediaKey: mediaKey, isRepeat: isRepeat, isSmallIncrement: isSmallIncrement, isPressed: isPressed, isContrast: isContrast)
   }
 
+  // The display under the mouse pointer cannot always be determined (pointer exactly on an edge, stale screen list right
+  // after a reconfiguration, no key window in focus mode). A key press must never silently do nothing in that case, so
+  // fall back to the external displays, and only if there are none, to the built-in display.
+  private func fallbackDisplays(isBrightness: Bool) -> [Display] {
+    let externalDisplays = DisplayManager.shared.getAllDisplays().filter { !$0.isBuiltIn() && !$0.isDummy && !$0.isVirtual }
+    if !externalDisplays.isEmpty {
+      return externalDisplays
+    }
+    if isBrightness, let builtIn = DisplayManager.shared.getBuiltInDisplay() {
+      return [builtIn]
+    }
+    return []
+  }
+
+  private func affectedDisplays(isBrightness: Bool, isVolume: Bool) -> [Display] {
+    if let affectedDisplays = DisplayManager.shared.getAffectedDisplays(isBrightness: isBrightness, isVolume: isVolume), !affectedDisplays.isEmpty {
+      return affectedDisplays
+    }
+    if isVolume, prefs.integer(forKey: PrefKey.multiKeyboardVolume.rawValue) == MultiKeyboardVolume.audioDeviceNameMatching.rawValue {
+      return [] // no display matches the audio device by name, this is intentional
+    }
+    let fallback = self.fallbackDisplays(isBrightness: isBrightness)
+    os_log("No target display found for %{public}@ key (mouse at %{public}@), falling back to %{public}@ display(s)", type: .default, isBrightness ? "brightness" : "volume", NSStringFromPoint(NSEvent.mouseLocation), String(fallback.count))
+    return fallback
+  }
+
   private func sendDisplayCommandVolumeMute(mediaKey: MediaKey, isRepeat: Bool, isSmallIncrement: Bool, isPressed: Bool) {
-    guard [.volumeUp, .volumeDown, .mute].contains(mediaKey), app.sleepID == 0, app.reconfigureID == 0, let affectedDisplays = DisplayManager.shared.getAffectedDisplays(isBrightness: false, isVolume: true) else {
+    guard [.volumeUp, .volumeDown, .mute].contains(mediaKey), app.sleepID == 0, app.reconfigureID == 0 else {
       return
     }
+    let affectedDisplays = self.affectedDisplays(isBrightness: false, isVolume: true)
     var wasNotIsPressedVolumeSentAlready = false
     for display in affectedDisplays where !display.readPrefAsBool(key: .isDisabled) {
       switch mediaKey {
@@ -104,9 +139,11 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
   }
 
   private func sendDisplayCommandBrightnessContrast(mediaKey: MediaKey, isRepeat _: Bool, isSmallIncrement: Bool, isPressed: Bool, isContrast: Bool = false) {
-    guard [.brightnessUp, .brightnessDown].contains(mediaKey), app.sleepID == 0, app.reconfigureID == 0, isPressed, let affectedDisplays = DisplayManager.shared.getAffectedDisplays(isBrightness: true, isVolume: false) else {
+    guard [.brightnessUp, .brightnessDown].contains(mediaKey), app.sleepID == 0, app.reconfigureID == 0, isPressed else {
       return
     }
+    let affectedDisplays = self.affectedDisplays(isBrightness: true, isVolume: false)
+    os_log("Brightness key %{public}@ targets %{public}@ display(s): %{public}@", type: .default, mediaKey == .brightnessUp ? "up" : "down", String(affectedDisplays.count), affectedDisplays.map { "\($0.identifier) \($0.name)" }.joined(separator: ", "))
     for display in affectedDisplays where !display.readPrefAsBool(key: .isDisabled) {
       switch mediaKey {
       case .brightnessUp:
@@ -178,11 +215,29 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
       }
     }
     self.mediaKeyTap?.stop()
+    self.mediaKeyTap = nil
+    self.watchedKeys = keys
     // returning an empty array listens for all mediakeys in MediaKeyTap
     if keys.count > 0 {
       self.mediaKeyTap = MediaKeyTap(delegate: self, on: KeyPressMode.keyDownAndUp, for: keys, observeBuiltIn: true)
       self.mediaKeyTap?.start()
     }
+    os_log("Media key tap registered for: %{public}@", type: .default, keys.isEmpty ? "nothing (tap not active)" : keys.map { String(describing: $0) }.joined(separator: ", "))
+  }
+
+  // Re-register the tap so that it is in front of any event tap another process registered in the meantime. macOS delivers
+  // key events to the most recently inserted head tap first, so a tap that was registered later (by the system or another
+  // app) can quietly take the brightness keys away from us. Users noticed that opening the settings window, which happens
+  // to re-register the tap, brought the keys back; this does the same thing automatically.
+  func refreshMediaKeyTapIfIdle() {
+    guard !self.watchedKeys.isEmpty else {
+      return
+    }
+    guard CACurrentMediaTime() - self.lastMediaKeyEventTime > 3 else {
+      return // a key was used a moment ago (or is being held), do not disturb it
+    }
+    os_log("Re-registering the media key tap to keep it in front of other event taps", type: .info)
+    self.updateMediaKeyTap()
   }
 
   func handleOpenPrefPane(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) -> Bool {
