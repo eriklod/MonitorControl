@@ -2,6 +2,7 @@
 
 import Foundation
 import IOKit
+import os.log
 
 let ARM64_DDC_7BIT_ADDRESS: UInt8 = 0x37 // This works with DisplayPort devices
 let ARM64_DDC_DATA_ADDRESS: UInt8 = 0x51
@@ -39,7 +40,7 @@ class Arm64DDC: NSObject {
     var matchScore: Int = 0
   }
 
-  static func getServiceMatches(displayIDs: [CGDirectDisplayID]) -> [Arm64Service] {
+  static func getServiceMatches(displayIDs: [CGDirectDisplayID], allowSingleCandidateFallback: Bool = true) -> [Arm64Service] {
     let ioregServicesForMatching = self.getIoregServicesForMatching()
     var matchedDisplayServices: [Arm64Service] = []
     var scoredCandidateDisplayServices: [Int: [Arm64Service]] = [:]
@@ -66,6 +67,19 @@ class Arm64DDC: NSObject {
         }
       }
     }
+    // Fallback: right after hot-plug or wake the IORegistry display attributes (EDID UUID, product name, location)
+    // are sometimes not populated yet, so every candidate scores 0 and the display ends up without an AVService.
+    // If there is exactly one display left and exactly one external AVService left, they belong together.
+    if allowSingleCandidateFallback {
+      let unmatchedDisplayIDs = displayIDs.filter { !takenDisplayIDs.contains($0) }
+      let unmatchedServices = ioregServicesForMatching.filter { $0.service != nil && !takenServiceLocations.contains($0.serviceLocation) }
+      if unmatchedDisplayIDs.count == 1, unmatchedServices.count == 1, let displayID = unmatchedDisplayIDs.first, let ioregService = unmatchedServices.first {
+        os_log("No scored AVService match for display %{public}@, pairing it with the only remaining external AVService (location %{public}@).", type: .info, String(displayID), String(ioregService.serviceLocation))
+        let discouraged = self.checkIfDiscouraged(ioregService: ioregService)
+        let dummy = self.checkIfDummy(ioregService: ioregService)
+        matchedDisplayServices.append(Arm64Service(displayID: displayID, service: ioregService.service, serviceLocation: ioregService.serviceLocation, discouraged: discouraged, dummy: dummy, serviceDetails: ioregService, matchScore: 0))
+      }
+    }
     return matchedDisplayServices
   }
 
@@ -73,9 +87,19 @@ class Arm64DDC: NSObject {
     var values: (UInt16, UInt16)?
     var send: [UInt8] = [command]
     var reply = [UInt8](repeating: 0, count: 11)
-    if Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, readSleepTime: readSleepTime, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime) {
+    if Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, readSleepTime: readSleepTime, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime, expectedCommand: command) {
+      guard reply[3] == 0x00 else {
+        os_log("DDC read of command %{public}@ reported as unsupported by the display (result code %{public}@).", type: .info, String(command), String(reply[3]))
+        return nil
+      }
       let max = UInt16(reply[6]) * 256 + UInt16(reply[7])
       let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
+      // A maximum of 0 (or a current value above the maximum) is never a valid VCP reply. Accepting it would make
+      // every subsequent write scale to 0 and the control would appear dead until the next reconfiguration.
+      guard max > 0, current <= max else {
+        os_log("DDC read of command %{public}@ returned implausible values (current %{public}@, max %{public}@), ignoring.", type: .info, String(command), String(current), String(max))
+        return nil
+      }
       values = (current, max)
     } else {
       values = nil
@@ -89,7 +113,7 @@ class Arm64DDC: NSObject {
     return Self.performDDCCommunication(service: service, send: &send, reply: &reply, writeSleepTime: writeSleepTime, numOfWriteCycles: numOfWriteCycles, numOfRetryAttemps: numOfRetryAttemps, retrySleepTime: retrySleepTime)
   }
 
-  static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8], writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil) -> Bool {
+  static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8], writeSleepTime: UInt32? = nil, numOfWriteCycles: UInt8? = nil, readSleepTime: UInt32? = nil, numOfRetryAttemps: UInt8? = nil, retrySleepTime: UInt32? = nil, expectedCommand: UInt8? = nil) -> Bool {
     let dataAddress = ARM64_DDC_DATA_ADDRESS
     var success = false
     guard service != nil else {
@@ -106,6 +130,12 @@ class Arm64DDC: NSObject {
         usleep(readSleepTime ?? 50000)
         if IOAVServiceReadI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), 0, &reply, UInt32(reply.count)) == 0 {
           success = self.checksum(chk: 0x50, data: &reply, start: 0, end: reply.count - 2) == reply[reply.count - 1]
+          if success, !self.isValidVCPReply(reply: reply, expectedCommand: expectedCommand) {
+            os_log("DDC reply has a valid checksum but an unexpected structure: %{public}@", type: .info, reply.map { String(format: "%02X", $0) }.joined(separator: " "))
+            success = false
+          }
+        } else {
+          success = false
         }
       }
       if success {
@@ -114,6 +144,20 @@ class Arm64DDC: NSObject {
       usleep(retrySleepTime ?? 20000)
     }
     return success
+  }
+
+  // Sanity check of a "Get VCP Feature" reply: [source 0x6E][length][0x02 = VCP reply][result code][opcode][type][max hi][max lo][cur hi][cur lo][checksum]
+  static func isValidVCPReply(reply: [UInt8], expectedCommand: UInt8?) -> Bool {
+    guard reply.count >= 11 else {
+      return false
+    }
+    guard reply[2] == 0x02 else {
+      return false
+    }
+    if let expectedCommand = expectedCommand, reply[3] == 0x00, reply[4] != expectedCommand {
+      return false
+    }
+    return true
   }
 
   // DDC checksum calculator

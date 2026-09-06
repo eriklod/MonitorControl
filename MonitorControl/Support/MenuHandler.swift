@@ -60,7 +60,8 @@ class MenuHandler: NSMenu, NSMenuDelegate {
     if numOfDisplays != 0 {
       let asSubMenu: Bool = (displays.count > 3 && !relevant && !combine && app.macOS10()) ? true : false
       var iterator = 0
-      for display in displays where (!relevant || DisplayManager.resolveEffectiveDisplayID(display.identifier) == DisplayManager.resolveEffectiveDisplayID(currentDisplay!.identifier)) && !display.isDummy {
+      let currentEffectiveDisplayID = currentDisplay.map { DisplayManager.resolveEffectiveDisplayID($0.identifier) }
+      for display in displays where (!relevant || (currentEffectiveDisplayID != nil && DisplayManager.resolveEffectiveDisplayID(display.identifier) == currentEffectiveDisplayID)) && !display.isDummy {
         iterator += 1
         if !relevant, !combine, iterator != 1, app.macOS10() {
           self.insertItem(NSMenuItem.separator(), at: 0)

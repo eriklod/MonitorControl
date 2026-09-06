@@ -12,6 +12,8 @@ class OtherDisplay: Display {
   let writeDDCQueue = DispatchQueue(label: "Local write DDC queue")
   var writeDDCNextValue: [Command: UInt16] = [:]
   var writeDDCLastSavedValue: [Command: UInt16] = [:]
+  var lastArm64AVServiceRecoveryTime: CFTimeInterval = 0
+  var consecutiveDDCWriteFailures: Int = 0
   var pollingCount: Int {
     get {
       switch self.readPrefAsInt(key: .pollingMode) {
@@ -79,11 +81,26 @@ class OtherDisplay: Display {
     if !self.smoothBrightnessRunning, !self.isSw(), !self.readPrefAsBool(key: .unavailableDDC, for: command), self.readPrefAsBool(key: .isTouched, for: command), prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.write.rawValue, !app.safeMode {
       let restoreValue = self.getDDCValueFromPrefs(command)
       os_log("Restoring %{public}@ DDC value %{public}@ for %{public}@", type: .info, String(reflecting: command), String(restoreValue), self.name)
+      // A restore must always reach the display, even if the same value was already sent before the display went to sleep.
+      self.forgetLastWrittenDDCValue(command: command)
       self.writeDDCValues(command: command, value: restoreValue)
       if command == .audioSpeakerVolume, self.readPrefAsBool(key: .enableMuteUnmute) {
         let currentMuteValue = self.readPrefAsInt(for: .audioMuteScreenBlank) == 0 ? 2 : self.readPrefAsInt(for: .audioMuteScreenBlank)
         os_log("- Writing last saved DDC value for Mute: %{public}@", type: .info, String(currentMuteValue))
+        self.forgetLastWrittenDDCValue(command: .audioMuteScreenBlank)
         self.writeDDCValues(command: .audioMuteScreenBlank, value: UInt16(currentMuteValue))
+      }
+    }
+  }
+
+  // Forget what was last written so that the next write of the same value is not skipped as a duplicate.
+  // Used after sleep/wake and reconfiguration, when the display may have lost or reset its state.
+  func forgetLastWrittenDDCValue(command: Command? = nil) {
+    self.writeDDCQueue.async(flags: .barrier) {
+      if let command = command {
+        self.writeDDCLastSavedValue.removeValue(forKey: command)
+      } else {
+        self.writeDDCLastSavedValue.removeAll()
       }
     }
   }
@@ -108,7 +125,6 @@ class OtherDisplay: Display {
         ddcValues = self.readDDCValues(for: command, tries: UInt(self.pollingCount), minReplyDelay: delay)
         if ddcValues != nil {
           (currentDDCValue, maxDDCValue) = ddcValues ?? (currentDDCValue, maxDDCValue)
-          self.processCurrentDDCValue(isReadFromDisplay: true, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
           os_log("- DDC read successful.", type: .info)
         } else {
           os_log("- DDC read failed.", type: .info)
@@ -119,9 +135,14 @@ class OtherDisplay: Display {
       if self.readPrefAsInt(key: .maxDDCOverride, for: command) > self.readPrefAsInt(key: .minDDCOverride, for: command) {
         self.savePref(self.readPrefAsInt(key: .maxDDCOverride, for: command), key: .maxDDC, for: command)
       } else {
-        self.savePref(min(Int(maxDDCValue), DDC_MAX_DETECT_LIMIT), key: .maxDDC, for: command)
+        // Never accept a maximum that is not above the minimum, otherwise every write would collapse to a single value.
+        let detectedMax = min(Int(maxDDCValue), DDC_MAX_DETECT_LIMIT)
+        self.savePref(detectedMax > self.readPrefAsInt(key: .minDDCOverride, for: command) ? detectedMax : DDC_MAX_DETECT_LIMIT, key: .maxDDC, for: command)
       }
-      if ddcValues == nil {
+      // The maximum must be known before the value read from the display can be converted, so this happens after saving maxDDC.
+      if ddcValues != nil {
+        self.processCurrentDDCValue(isReadFromDisplay: true, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
+      } else {
         self.processCurrentDDCValue(isReadFromDisplay: false, command: command, firstrun: firstrun, currentDDCValue: currentDDCValue)
         currentDDCValue = self.getDDCValueFromPrefs(command)
       }
@@ -399,23 +420,54 @@ class OtherDisplay: Display {
     guard value != UInt16.max, value != lastValue else {
       return
     }
-    self.writeDDCQueue.async(flags: .barrier) {
-      self.writeDDCLastSavedValue[command] = value
-      self.savePref(true, key: PrefKey.isTouched, for: command)
-    }
+    self.savePref(true, key: PrefKey.isTouched, for: command)
     var controlCodes = self.getRemapControlCodes(command: command)
     if controlCodes.count == 0 {
       controlCodes.append(command.rawValue)
     }
+    var allWritesSucceeded = true
     for controlCode in controlCodes {
+      var success = true
       if Arm64DDC.isArm64 {
         if self.arm64ddc {
-          _ = Arm64DDC.write(service: self.arm64avService, command: controlCode, value: value)
+          success = Arm64DDC.write(service: self.arm64avService, command: controlCode, value: value)
+          if !success, self.recoverArm64AVService() {
+            os_log("Retrying DDC write of %{public}@ for display %{public}@ after AVService recovery.", type: .info, String(reflecting: command), String(self.identifier))
+            success = Arm64DDC.write(service: self.arm64avService, command: controlCode, value: value)
+          }
         }
       } else {
-        _ = self.ddc?.write(command: controlCode, value: value, errorRecoveryWaitTime: 2000) ?? false
+        success = self.ddc?.write(command: controlCode, value: value, errorRecoveryWaitTime: 2000) ?? false
+      }
+      if !success {
+        allWritesSucceeded = false
       }
     }
+    if allWritesSucceeded {
+      self.consecutiveDDCWriteFailures = 0
+      // Only remember the value once the display has acknowledged it. A failed write must not suppress the next attempt with the same value.
+      self.writeDDCQueue.async(flags: .barrier) {
+        self.writeDDCLastSavedValue[command] = value
+      }
+    } else {
+      self.consecutiveDDCWriteFailures += 1
+      os_log("DDC write of %{public}@ (value %{public}@) failed for display %{public}@ (%{public}@ consecutive failures).", type: .error, String(reflecting: command), String(value), String(self.identifier), String(self.consecutiveDDCWriteFailures))
+    }
+  }
+
+  // After sleep, display standby or a cable/dock re-plug the IOAVService handle we hold can go stale while the display
+  // itself is fine. When a write fails, look the service up again (rate limited) so the next attempt uses a fresh handle.
+  func recoverArm64AVService() -> Bool {
+    guard Arm64DDC.isArm64, app.sleepID == 0, app.reconfigureID == 0 else {
+      return false
+    }
+    let now = CACurrentMediaTime()
+    guard now - self.lastArm64AVServiceRecoveryTime > 2 else {
+      return false
+    }
+    self.lastArm64AVServiceRecoveryTime = now
+    os_log("DDC write failed for display %{public}@, attempting to refresh its AVService.", type: .info, String(self.identifier))
+    return DisplayManager.shared.refreshArm64AVService(for: self)
   }
 
   func readDDCValues(for command: Command, tries: UInt, minReplyDelay delay: UInt64?) -> (current: UInt16, max: UInt16)? {
@@ -487,6 +539,9 @@ class OtherDisplay: Display {
     let curveMultiplier = self.getCurveMultiplier(self.readPrefAsInt(key: .curveDDC, for: command))
     let minDDCValue = Float(self.readPrefAsInt(key: .minDDCOverride, for: command))
     let maxDDCValue = Float(self.readPrefAsInt(key: .maxDDC, for: command))
+    guard maxDDCValue > minDDCValue else {
+      return UInt16(max(0, minDDCValue))
+    }
     let curvedValue = pow(max(min(value, 1), 0), curveMultiplier)
     let deNormalizedValue = (maxDDCValue - minDDCValue) * curvedValue + minDDCValue
     var intDDCValue = UInt16(min(max(deNormalizedValue, minDDCValue), maxDDCValue))
@@ -500,6 +555,9 @@ class OtherDisplay: Display {
     let curveMultiplier = self.getCurveMultiplier(self.readPrefAsInt(key: .curveDDC, for: command))
     let minDDCValue = Float(self.readPrefAsInt(key: .minDDCOverride, for: command))
     let maxDDCValue = Float(self.readPrefAsInt(key: .maxDDC, for: command))
+    guard maxDDCValue > minDDCValue else {
+      return 0
+    }
     let normalizedValue = ((min(max(Float(from), minDDCValue), maxDDCValue) - minDDCValue) / (maxDDCValue - minDDCValue))
     let deCurvedValue = pow(normalizedValue, 1.0 / curveMultiplier)
     var value = deCurvedValue

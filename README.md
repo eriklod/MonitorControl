@@ -24,6 +24,25 @@ Use menubar extra sliders or the keyboard, including native Apple keys!</p>
 
 <hr>
 
+## About this fork (eriklod/MonitorControl, branch `reliability`)
+
+This is a personal fork of [MonitorControl](https://github.com/MonitorControl/MonitorControl) focused on one thing: making DDC brightness and volume control on Apple Silicon MacBooks work **every** time, not just sometimes. Upstream MonitorControl gives up when the display's DDC service is not ready yet at the moment a display is (re)connected or the Mac wakes up, and it stays broken until the next display reconfiguration. This fork keeps trying and recovers on its own.
+
+What changed compared to upstream:
+
+- **Retry finding the DDC service after hot-plug and wake.** On Apple Silicon the `IOAVService` for a display is often not available yet when macOS reports the display. The app now retries with increasing delays (2, 3, 5, 8 and 12 seconds) and activates the display as soon as the service shows up.
+- **Fallback pairing for a single external display.** If the display attributes needed for matching are not populated yet but there is exactly one external display and exactly one external DDC service, they are paired anyway.
+- **Verify every DDC write.** If a write fails, the DDC service is looked up again and the write is retried once. A failed write is no longer remembered as "already written", so the next key press or slider move always reaches the display.
+- **Always re-send saved values after wake.** With "Apply last saved settings" enabled, the restore after sleep was silently skipped because the values were considered already written. It now goes through, and volume is restored as well as brightness and contrast.
+- **Reject bogus DDC reads.** A read that fails on the I2C bus was previously reported as successful and could store a maximum of 0, after which every write collapsed to 0 and the control appeared dead. Replies are now validated (structure, opcode, result code, plausible values) before being used, and a maximum that is not above the minimum is never accepted.
+- **No accidental crash when the mouse is between screens** (force unwrap in the menu builder).
+- **CI build.** A GitHub Actions workflow builds an ad-hoc signed `MonitorControl.app` on every push; download it from the workflow run's artifacts. Tagging `v*` creates a GitHub release with the zip attached.
+- **No automatic updates from upstream.** The build number is set high on purpose so Sparkle never replaces this build with an upstream release. Update by downloading a new build from this repository instead.
+
+Everything else, including the app itself, is the work of the MonitorControl authors. See the sections below for the original documentation.
+
+<hr>
+
 > [!WARNING]
 > MonitorControl v4.2.0 [may crash](https://github.com/MonitorControl/MonitorControl/issues/1663) on certain configurations running macOS 15 Sequoia or Tahoe. Additionally, this version will not automatically update to the [latest app version](https://github.com/MonitorControl/MonitorControl/releases). To resolve the issue and ensure future updates, please upgrade manually.
 

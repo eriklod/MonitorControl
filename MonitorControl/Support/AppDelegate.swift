@@ -24,6 +24,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   var statusItemVisibilityChangedByUser = true
   var reconfigureID: Int = 0 // dispatched reconfigure command ID
   var sleepID: Int = 0 // sleep event ID
+  var avServiceRetryID: Int = 0 // generation counter for scheduled AVService re-matching attempts
+  let avServiceRetryDelays: [Double] = [2, 3, 5, 8, 12] // seconds between attempts, about 30 seconds in total
   var safeMode = false
   var jobRunning = false
   var startupActionWriteCounter: Int = 0
@@ -119,6 +121,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     DisplayManager.shared.resetSwBrightnessForAllDisplays(noPrefSave: true)
     CGDisplayRestoreColorSyncSettings()
     self.reconfigureID += 1
+    self.cancelArm64AVServiceRetries()
     self.updateMediaKeyTap()
     os_log("Bumping reconfigureID to %{public}@", type: .info, String(self.reconfigureID))
     _ = DisplayManager.shared.destroyAllShades()
@@ -140,12 +143,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     DisplayManager.shared.gammaInterferenceCounter = 0
     DisplayManager.shared.configureDisplays()
     DisplayManager.shared.addDisplayCounterSuffixes()
-    DisplayManager.shared.updateArm64AVServices()
+    let avServiceResult = DisplayManager.shared.updateArm64AVServices()
     if firstrun && prefs.integer(forKey: PrefKey.startupAction.rawValue) != StartupAction.write.rawValue {
       DisplayManager.shared.resetSwBrightnessForAllDisplays(prefsOnly: true)
     }
     DisplayManager.shared.setupOtherDisplays(firstrun: firstrun)
     self.updateMenusAndKeys()
+    if !avServiceResult.unmatched.isEmpty {
+      self.scheduleArm64AVServiceRetry(firstrun: firstrun)
+    }
     if !firstrun || prefs.integer(forKey: PrefKey.startupAction.rawValue) == StartupAction.write.rawValue {
       if !prefs.bool(forKey: PrefKey.disableCombinedBrightness.rawValue) {
         DisplayManager.shared.restoreSwBrightnessForAllDisplays(async: !prefs.bool(forKey: PrefKey.disableSmoothBrightness.rawValue))
@@ -182,6 +188,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   @objc private func sleepNotification() {
     self.sleepID += 1
     os_log("Sleeping with sleep %{public}@", type: .info, String(self.sleepID))
+    self.cancelArm64AVServiceRetries()
     self.updateMediaKeyTap()
   }
 
@@ -199,18 +206,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if self.sleepID == dispatchedSleepID {
       os_log("Sober from sleep %{public}@", type: .info, String(self.sleepID))
       self.sleepID = 0
+      // Whatever was written before sleep may have been lost by the display, so the next write of the same value must go through.
+      for otherDisplay in DisplayManager.shared.getOtherDisplays() {
+        otherDisplay.forgetLastWrittenDDCValue()
+      }
       if self.reconfigureID != 0 {
         let dispatchedReconfigureID = self.reconfigureID
         os_log("Displays need reconfig after sober with reconfigureID %{public}@", type: .info, String(dispatchedReconfigureID))
         self.configure(dispatchedReconfigureID: dispatchedReconfigureID)
       } else if Arm64DDC.isArm64 {
         os_log("Displays don't need reconfig after sober but might need AVServices update", type: .info)
-        DisplayManager.shared.updateArm64AVServices()
+        let avServiceResult = DisplayManager.shared.updateArm64AVServices()
+        if !avServiceResult.newlyMatched.isEmpty {
+          self.activateLateMatchedDisplays(avServiceResult.newlyMatched)
+        }
+        if !avServiceResult.unmatched.isEmpty {
+          self.scheduleArm64AVServiceRetry()
+        }
         self.job(start: true)
       }
       self.startupActionWriteRepeatAfterSober()
       self.updateMediaKeyTap()
     }
+  }
+
+  // MARK: - AVService re-matching after hot-plug and wake
+
+  // On Apple Silicon the IOAVService of a freshly (re)connected or woken display is often not ready yet when the display
+  // reconfiguration callback fires. Instead of giving up (which leaves the display in software-only mode until the next
+  // reconfiguration), keep trying for a while with increasing delays.
+  func scheduleArm64AVServiceRetry(attempt: Int = 1, firstrun: Bool = false) {
+    guard Arm64DDC.isArm64, attempt >= 1, attempt <= self.avServiceRetryDelays.count else {
+      if attempt > self.avServiceRetryDelays.count {
+        os_log("Giving up on AVService matching for now, %{public}@ display(s) remain without DDC.", type: .info, String(DisplayManager.shared.getUnmatchedArm64Displays().count))
+      }
+      return
+    }
+    self.avServiceRetryID += 1
+    let dispatchedRetryID = self.avServiceRetryID
+    let delay = self.avServiceRetryDelays[attempt - 1]
+    os_log("Scheduling AVService matching attempt %{public}@ in %{public}@ seconds", type: .info, String(attempt), String(delay))
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+      self.retryArm64AVServiceMatching(dispatchedRetryID: dispatchedRetryID, attempt: attempt, firstrun: firstrun)
+    }
+  }
+
+  private func cancelArm64AVServiceRetries() {
+    self.avServiceRetryID += 1
+  }
+
+  private func retryArm64AVServiceMatching(dispatchedRetryID: Int, attempt: Int, firstrun: Bool) {
+    guard dispatchedRetryID == self.avServiceRetryID, self.sleepID == 0, self.reconfigureID == 0 else {
+      os_log("AVService matching attempt %{public}@ skipped (superseded by sleep or reconfiguration)", type: .info, String(attempt))
+      return
+    }
+    os_log("AVService matching attempt %{public}@", type: .info, String(attempt))
+    let result = DisplayManager.shared.updateArm64AVServices()
+    if !result.newlyMatched.isEmpty {
+      self.activateLateMatchedDisplays(result.newlyMatched, firstrun: firstrun)
+    }
+    if !result.unmatched.isEmpty {
+      self.scheduleArm64AVServiceRetry(attempt: attempt + 1, firstrun: firstrun)
+    }
+  }
+
+  // A display that got its AVService after the initial configuration needs the same setup it would have received then.
+  private func activateLateMatchedDisplays(_ displays: [OtherDisplay], firstrun: Bool = false) {
+    for otherDisplay in displays {
+      os_log("Display %{public}@ became DDC controllable, setting it up", type: .info, String(otherDisplay.identifier))
+      otherDisplay.forgetLastWrittenDDCValue()
+      DisplayManager.shared.setupOtherDisplay(otherDisplay, firstrun: firstrun)
+    }
+    self.updateMenusAndKeys()
+    displaysPrefsVc?.loadDisplayList()
   }
 
   private func startupActionWriteRepeatAfterSober(dispatchedCounter: Int = 0) {

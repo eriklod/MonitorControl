@@ -191,22 +191,35 @@ class DisplayManager {
 
   func setupOtherDisplays(firstrun: Bool = false) {
     for otherDisplay in self.getOtherDisplays() {
-      for command in [Command.audioSpeakerVolume, Command.contrast] where !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: command) && !otherDisplay.isSw() {
-        otherDisplay.setupCurrentAndMaxValues(command: command, firstrun: firstrun)
-      }
-      if (!otherDisplay.isSw() && !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: .brightness)) || otherDisplay.isSw() {
-        otherDisplay.setupCurrentAndMaxValues(command: .brightness, firstrun: firstrun)
-        otherDisplay.brightnessSyncSourceValue = otherDisplay.readPrefAsFloat(for: .brightness)
-      }
+      self.setupOtherDisplay(otherDisplay, firstrun: firstrun)
+    }
+  }
+
+  func setupOtherDisplay(_ otherDisplay: OtherDisplay, firstrun: Bool = false) {
+    for command in [Command.audioSpeakerVolume, Command.contrast] where !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: command) && !otherDisplay.isSw() {
+      otherDisplay.setupCurrentAndMaxValues(command: command, firstrun: firstrun)
+    }
+    if (!otherDisplay.isSw() && !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: .brightness)) || otherDisplay.isSw() {
+      otherDisplay.setupCurrentAndMaxValues(command: .brightness, firstrun: firstrun)
+      otherDisplay.brightnessSyncSourceValue = otherDisplay.readPrefAsFloat(for: .brightness)
     }
   }
 
   func restoreOtherDisplays() {
     for otherDisplay in self.getDdcCapableDisplays() {
-      for command in [Command.contrast, Command.brightness] where !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: command) {
+      for command in [Command.contrast, Command.brightness, Command.audioSpeakerVolume] where !otherDisplay.readPrefAsBool(key: .unavailableDDC, for: command) {
         otherDisplay.restoreDDCSettingsToDisplay(command: command)
       }
     }
+  }
+
+  // Displays that should have an AVService on Apple Silicon: real, physical external displays.
+  func getArm64DDCEligibleDisplays() -> [OtherDisplay] {
+    self.getOtherDisplays().filter { !$0.isVirtual && !$0.isDummy && !$0.isDiscouraged }
+  }
+
+  func getUnmatchedArm64Displays() -> [OtherDisplay] {
+    self.getArm64DDCEligibleDisplays().filter { !$0.arm64ddc || $0.arm64avService == nil }
   }
 
   func normalizedName(_ name: String) -> String {
@@ -333,31 +346,58 @@ class DisplayManager {
     }
   }
 
-  func updateArm64AVServices() {
-    if Arm64DDC.isArm64 {
-      os_log("arm64 AVService update requested", type: .info)
-      var displayIDs: [CGDirectDisplayID] = []
-      for otherDisplay in self.getOtherDisplays() {
-        displayIDs.append(otherDisplay.identifier)
+  struct Arm64AVServiceUpdateResult {
+    var matched: [OtherDisplay] = [] // displays that received a (fresh) AVService in this round
+    var newlyMatched: [OtherDisplay] = [] // subset of matched that had no working AVService before
+    var unmatched: [OtherDisplay] = [] // eligible displays for which no AVService could be found in this round
+  }
+
+  // Looks up the IOAVService for every physical external display. Only the displays in `only` are updated when it is given.
+  // Existing handles are kept when the lookup fails, so a display never loses a possibly still working service because of a
+  // transient IORegistry hiccup; callers use `unmatched` to schedule another attempt.
+  @discardableResult
+  func updateArm64AVServices(only: [OtherDisplay]? = nil) -> Arm64AVServiceUpdateResult {
+    var result = Arm64AVServiceUpdateResult()
+    guard Arm64DDC.isArm64 else {
+      return result
+    }
+    os_log("arm64 AVService update requested", type: .info)
+    let eligibleDisplays = self.getArm64DDCEligibleDisplays()
+    let targetDisplays = only ?? eligibleDisplays
+    let displayIDs = eligibleDisplays.map { $0.identifier }
+    let serviceMatches = Arm64DDC.getServiceMatches(displayIDs: displayIDs)
+    for otherDisplay in targetDisplays {
+      let hadWorkingService = otherDisplay.arm64ddc && otherDisplay.arm64avService != nil
+      guard let serviceMatch = serviceMatches.first(where: { $0.displayID == otherDisplay.identifier && $0.service != nil }) else {
+        os_log("No AVService found for display %{public}@ (%{public}@)", type: .info, String(otherDisplay.identifier), hadWorkingService ? "keeping previous service" : "display is not DDC controllable yet")
+        result.unmatched.append(otherDisplay)
+        continue
       }
-      for serviceMatch in Arm64DDC.getServiceMatches(displayIDs: displayIDs) {
-        for otherDisplay in self.getOtherDisplays() where otherDisplay.identifier == serviceMatch.displayID && serviceMatch.service != nil {
-          otherDisplay.arm64avService = serviceMatch.service
-          os_log("Display service match successful for display %{public}@", type: .info, String(serviceMatch.displayID))
-          if serviceMatch.discouraged {
-            os_log("Display %{public}@ is flagged as discouraged by Arm64DDC.", type: .info, String(serviceMatch.displayID))
-            otherDisplay.isDiscouraged = true
-          } else if serviceMatch.dummy {
-            os_log("Display %{public}@ is flagged as dummy by Arm64DDC.", type: .info, String(serviceMatch.displayID))
-            otherDisplay.isDiscouraged = true
-            otherDisplay.isDummy = true
-          } else {
-            otherDisplay.arm64ddc = DEBUG_SW ? false : true // MARK: (point of interest when testing)
-          }
+      otherDisplay.arm64avService = serviceMatch.service
+      os_log("Display service match successful for display %{public}@ (match score %{public}@)", type: .info, String(serviceMatch.displayID), String(serviceMatch.matchScore))
+      if serviceMatch.discouraged {
+        os_log("Display %{public}@ is flagged as discouraged by Arm64DDC.", type: .info, String(serviceMatch.displayID))
+        otherDisplay.isDiscouraged = true
+      } else if serviceMatch.dummy {
+        os_log("Display %{public}@ is flagged as dummy by Arm64DDC.", type: .info, String(serviceMatch.displayID))
+        otherDisplay.isDiscouraged = true
+        otherDisplay.isDummy = true
+      } else {
+        otherDisplay.arm64ddc = DEBUG_SW ? false : true // MARK: (point of interest when testing)
+        result.matched.append(otherDisplay)
+        if !hadWorkingService {
+          result.newlyMatched.append(otherDisplay)
         }
       }
-      os_log("AVService update done", type: .info)
     }
+    os_log("AVService update done: %{public}@ matched, %{public}@ newly matched, %{public}@ unmatched", type: .info, String(result.matched.count), String(result.newlyMatched.count), String(result.unmatched.count))
+    return result
+  }
+
+  // Re-resolve the AVService of a single display after a failed DDC write. Returns true if a service was found.
+  func refreshArm64AVService(for otherDisplay: OtherDisplay) -> Bool {
+    let result = self.updateArm64AVServices(only: [otherDisplay])
+    return result.matched.contains(where: { $0 == otherDisplay })
   }
 
   func resetSwBrightnessForAllDisplays(prefsOnly: Bool = false, noPrefSave: Bool = false, async: Bool = false) {
