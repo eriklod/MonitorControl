@@ -29,25 +29,25 @@ jobs:
             -project MonitorControl.xcodeproj \
             -scheme MonitorControl \
             -configuration Release \
-            -derivedDataPath build \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             -destination "generic/platform=macOS" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
             > build.log 2>&1 || { echo "::group::errors"; grep -E "error:|\*\* BUILD FAILED" build.log || true; echo "::endgroup::"; tail -n 80 build.log; exit 1; }
-          test -d build/Build/Products/Release/MonitorControl.app
+          test -d "$RUNNER_TEMP/DerivedData/Build/Products/Release/MonitorControl.app"
 
       - name: Ad-hoc sign
         # macOS will not grant Accessibility permission to a completely unsigned app; an ad-hoc signature is enough for personal use.
         run: |
-          APP=build/Build/Products/Release/MonitorControl.app
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release/MonitorControl.app"
           codesign --force --deep --sign - "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Package
         run: |
-          cd build/Build/Products/Release
+          cd "$RUNNER_TEMP/DerivedData/Build/Products/Release"
           ditto -c -k --sequesterRsrc --keepParent MonitorControl.app MonitorControl.zip
           shasum -a 256 MonitorControl.zip | tee MonitorControl.zip.sha256
 
@@ -56,8 +56,8 @@ jobs:
         with:
           name: MonitorControl-${{ github.ref_name }}-${{ github.sha }}
           path: |
-            build/Build/Products/Release/MonitorControl.zip
-            build/Build/Products/Release/MonitorControl.zip.sha256
+            ${{ runner.temp }}/DerivedData/Build/Products/Release/MonitorControl.zip
+            ${{ runner.temp }}/DerivedData/Build/Products/Release/MonitorControl.zip.sha256
           if-no-files-found: error
 
       - name: Upload build log
@@ -73,6 +73,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/Build/Products/Release/MonitorControl.zip
-            build/Build/Products/Release/MonitorControl.zip.sha256
+            ${{ runner.temp }}/DerivedData/Build/Products/Release/MonitorControl.zip
+            ${{ runner.temp }}/DerivedData/Build/Products/Release/MonitorControl.zip.sha256
           generate_release_notes: true
