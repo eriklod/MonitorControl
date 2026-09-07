@@ -402,9 +402,18 @@ class HIDBrightnessKeyListener {
   private var manager: IOHIDManager?
   private(set) var isRunning = false
   private var accessRequested = false
+  private var fnKeyPressed = false
 
-  // (usage page, usage) pairs Apple keyboards use for the brightness keys
-  private let brightnessUsages: [(page: UInt32, usage: UInt32, isUp: Bool, name: String)] = [
+  private let pageKeyboard: UInt32 = 0x07
+  private let pageConsumer: UInt32 = 0x0C
+  private let pageAppleVendorTopCase: UInt32 = 0xFF
+  private let pageAppleVendorKeyboard: UInt32 = 0xFF01
+  private let usageF1: UInt32 = 0x3A
+  private let usageF2: UInt32 = 0x3B
+  private let usageTopCaseFn: UInt32 = 0x03
+
+  // Usages that directly mean "brightness up/down". External keyboards and some Apple keyboards report these.
+  private let directBrightnessUsages: [(page: UInt32, usage: UInt32, isUp: Bool, name: String)] = [
     (0x0C, 0x6F, true, "Consumer/DisplayBrightnessIncrement"),
     (0x0C, 0x70, false, "Consumer/DisplayBrightnessDecrement"),
     (0xFF, 0x20, true, "AppleVendorTopCase/BrightnessUp"),
@@ -430,7 +439,17 @@ class HIDBrightnessKeyListener {
     }
     let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     IOHIDManagerSetDeviceMatching(manager, nil) // all devices, the element matching below limits what we receive
-    let inputMatching: [[String: Int]] = self.brightnessUsages.map { [kIOHIDElementUsagePageKey: Int($0.page), kIOHIDElementUsageKey: Int($0.usage)] }
+    // Apple's built-in keyboards report F1/F2 as plain function keys plus the state of the fn key; the translation to
+    // "brightness" normally happens in the system's keyboard driver, which is exactly the step that is skipped with the
+    // lid closed. So listen to those raw keys too and do the translation ourselves. Whole media key pages are matched so
+    // that whatever a keyboard sends for its brightness keys ends up in the log.
+    let inputMatching: [[String: Int]] = [
+      [kIOHIDElementUsagePageKey: Int(self.pageKeyboard), kIOHIDElementUsageKey: Int(self.usageF1)],
+      [kIOHIDElementUsagePageKey: Int(self.pageKeyboard), kIOHIDElementUsageKey: Int(self.usageF2)],
+      [kIOHIDElementUsagePageKey: Int(self.pageConsumer)],
+      [kIOHIDElementUsagePageKey: Int(self.pageAppleVendorTopCase)],
+      [kIOHIDElementUsagePageKey: Int(self.pageAppleVendorKeyboard)],
+    ]
     IOHIDManagerSetInputValueMatchingMultiple(manager, inputMatching as CFArray)
     IOHIDManagerRegisterInputValueCallback(manager, { _, _, _, value in
       HIDBrightnessKeyListener.shared.handle(value: value)
@@ -444,7 +463,7 @@ class HIDBrightnessKeyListener {
     }
     self.manager = manager
     self.isRunning = true
-    os_log("Listening for the brightness keys directly on the keyboard (HID)", type: .default)
+    os_log("Listening for the brightness keys directly on the keyboard (HID); F1/F2 as standard function keys: %{public}@", type: .default, String(self.functionKeysAreStandard()))
   }
 
   func stop() {
@@ -459,19 +478,48 @@ class HIDBrightnessKeyListener {
     os_log("Stopped listening for the brightness keys on the keyboard (HID)", type: .default)
   }
 
+  // System Settings > Keyboard > "Use F1, F2, etc. keys as standard function keys"
+  private func functionKeysAreStandard() -> Bool {
+    if let value = CFPreferencesCopyValue("com.apple.keyboard.fnState" as CFString, kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) {
+      if let number = value as? NSNumber {
+        return number.boolValue
+      }
+    }
+    return false
+  }
+
   private func handle(value: IOHIDValue) {
     let element = IOHIDValueGetElement(value)
     let page = IOHIDElementGetUsagePage(element)
     let usage = IOHIDElementGetUsage(element)
-    guard let match = self.brightnessUsages.first(where: { $0.page == page && $0.usage == usage }) else {
-      return
-    }
     let pressed = IOHIDValueGetIntegerValue(value) != 0
-    os_log("HID brightness key %{public}@ %{public}@", type: .default, match.name, pressed ? "pressed" : "released")
-    guard pressed else {
+    if page == self.pageAppleVendorTopCase, usage == self.usageTopCaseFn {
+      self.fnKeyPressed = pressed
       return
     }
-    let isUp = match.isUp
+    if page == self.pageKeyboard {
+      guard usage == self.usageF1 || usage == self.usageF2 else {
+        return
+      }
+      // Without "standard function keys" a bare F1 means brightness and fn+F1 means F1; with the setting it is the other way round.
+      let isBrightnessKey = self.fnKeyPressed == self.functionKeysAreStandard()
+      os_log("HID key %{public}@ %{public}@ (fn held: %{public}@) -> %{public}@", type: .default, usage == self.usageF1 ? "F1" : "F2", pressed ? "pressed" : "released", String(self.fnKeyPressed), isBrightnessKey ? "brightness" : "plain function key, ignored")
+      guard pressed, isBrightnessKey else {
+        return
+      }
+      self.dispatch(isUp: usage == self.usageF2)
+      return
+    }
+    // Consumer and Apple vendor pages: log everything (these pages only carry media/function keys), act on the brightness ones.
+    let match = self.directBrightnessUsages.first(where: { $0.page == page && $0.usage == usage })
+    os_log("HID media key usage page 0x%{public}@ usage 0x%{public}@ %{public}@%{public}@", type: .default, String(page, radix: 16), String(usage, radix: 16), pressed ? "pressed" : "released", match.map { " (" + $0.name + ")" } ?? "")
+    guard pressed, let brightness = match else {
+      return
+    }
+    self.dispatch(isUp: brightness.isUp)
+  }
+
+  private func dispatch(isUp: Bool) {
     DispatchQueue.main.async {
       app.mediaKeyTap.handleBrightnessKeyFromHID(isUp: isUp)
     }
