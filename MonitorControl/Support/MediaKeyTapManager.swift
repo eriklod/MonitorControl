@@ -417,14 +417,16 @@ class HIDBrightnessKeyListener {
     guard !self.isRunning else {
       return
     }
-    let access = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
-    guard access == kIOHIDAccessTypeGranted else {
-      if !self.accessRequested {
-        self.accessRequested = true
-        os_log("Input Monitoring is not granted yet (state %{public}@). Requesting it so the brightness keys can be read from the keyboard directly; grant it in System Settings > Privacy & Security > Input Monitoring.", type: .default, String(access.rawValue))
-        _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+    if #available(macOS 10.15, *) {
+      let access = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+      guard access == kIOHIDAccessTypeGranted else {
+        if !self.accessRequested {
+          self.accessRequested = true
+          os_log("Input Monitoring is not granted yet (state %{public}@). Requesting it so the brightness keys can be read from the keyboard directly; grant it in System Settings > Privacy & Security > Input Monitoring.", type: .default, String(access.rawValue))
+          _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        }
+        return
       }
-      return
     }
     let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     IOHIDManagerSetDeviceMatching(manager, nil) // all devices, the element matching below limits what we receive
