@@ -3,6 +3,7 @@
 import AudioToolbox
 import Cocoa
 import Foundation
+import IOKit.hid
 import MediaKeyTap
 import os.log
 
@@ -11,7 +12,10 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
   var keyRepeatTimers: [MediaKey: Timer] = [:]
   var lastMediaKeyEventTime: CFTimeInterval = 0 // used by the tap watchdog to avoid re-registering the tap while keys are in use
   var watchedKeys: [MediaKey] = [] // the keys the current tap was started with
+  var lastBrightnessKeyPressTime: CFTimeInterval = 0 // de-duplicates a brightness key press that arrives via both the event tap and HID
+  let brightnessKeyDuplicateWindow: CFTimeInterval = 0.25
 
+  // Delegate entry point for key events delivered by the event tap.
   func handle(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) {
     let isPressed = event?.keyPressed ?? true
     let isRepeat = event?.keyRepeat ?? false
@@ -20,7 +24,37 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
       // Logged at default level on purpose: info level messages are not persisted on recent macOS versions, and this line
       // is what tells us whether a key press reached the app at all when a user reports "the keys do nothing".
       os_log("Media key %{public}@ received (sleepID %{public}@, reconfigureID %{public}@)", type: .default, String(describing: mediaKey), String(app.sleepID), String(app.reconfigureID))
+      if [.brightnessUp, .brightnessDown].contains(mediaKey) {
+        if CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
+          os_log("- ignored, the same press was already handled via HID", type: .default)
+          return
+        }
+        self.lastBrightnessKeyPressTime = CACurrentMediaTime()
+      }
     }
+    self.processMediaKey(mediaKey: mediaKey, event: event, modifiers: modifiers)
+  }
+
+  // Entry point for brightness keys read directly from the keyboard (see HIDBrightnessKeyListener). On some macOS versions
+  // (seen on Tahoe with the lid closed) the brightness keys never become system-defined key events, so the event tap never
+  // sees them while the volume keys work fine. Reading the keyboard's HID reports does not depend on that routing.
+  func handleBrightnessKeyFromHID(isUp: Bool) {
+    guard [KeyboardBrightness.media.rawValue, KeyboardBrightness.both.rawValue].contains(prefs.integer(forKey: PrefKey.keyboardBrightness.rawValue)), self.watchedKeys.contains(.brightnessUp) else {
+      return // brightness media keys are disabled or currently disengaged (no external display, sleep, reconfiguration)
+    }
+    self.lastMediaKeyEventTime = CACurrentMediaTime()
+    if CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
+      os_log("Brightness key %{public}@ via HID ignored, the same press was already handled via the event tap", type: .default, isUp ? "up" : "down")
+      return
+    }
+    self.lastBrightnessKeyPressTime = CACurrentMediaTime()
+    os_log("Media key %{public}@ received via HID (sleepID %{public}@, reconfigureID %{public}@)", type: .default, isUp ? "brightnessUp" : "brightnessDown", String(app.sleepID), String(app.reconfigureID))
+    self.processMediaKey(mediaKey: isUp ? .brightnessUp : .brightnessDown, event: nil, modifiers: NSEvent.modifierFlags)
+  }
+
+  private func processMediaKey(mediaKey: MediaKey, event: KeyEvent?, modifiers: NSEvent.ModifierFlags?) {
+    let isPressed = event?.keyPressed ?? true
+    let isRepeat = event?.keyRepeat ?? false
     let isControl = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.control])) ?? false
     let isCommand = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.command])) ?? false
     let isOption = modifiers?.isSuperset(of: NSEvent.ModifierFlags([.option])) ?? false
@@ -224,6 +258,11 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
     }
     os_log("Media key tap registered for: %{public}@ (Accessibility trusted: %{public}@)", type: .default, keys.isEmpty ? "nothing (tap not active)" : keys.map { String(describing: $0) }.joined(separator: ", "), String(AXIsProcessTrusted()))
     self.startDiagnosticTap(active: !keys.isEmpty)
+    if keys.contains(.brightnessUp) || keys.contains(.brightnessDown) {
+      HIDBrightnessKeyListener.shared.start()
+    } else {
+      HIDBrightnessKeyListener.shared.stop()
+    }
   }
 
   // MARK: - Diagnostic event tap
@@ -350,5 +389,89 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
     let status = AXIsProcessTrustedWithOptions(options)
     os_log("Reading Accessibility privileges - Current access status %{public}@", type: .info, String(status))
     return status
+  }
+}
+
+// Reads the brightness keys straight from the keyboard's HID reports. This is a fallback for the event tap: on macOS Tahoe
+// with the MacBook lid closed the brightness keys are not turned into system-defined key events at all (there is no
+// built-in display to control), so no event tap can ever see them. HID reports are delivered regardless. Listening to HID
+// input requires the Input Monitoring permission; the system asks for it once.
+class HIDBrightnessKeyListener {
+  static let shared = HIDBrightnessKeyListener()
+
+  private var manager: IOHIDManager?
+  private(set) var isRunning = false
+  private var accessRequested = false
+
+  // (usage page, usage) pairs Apple keyboards use for the brightness keys
+  private let brightnessUsages: [(page: UInt32, usage: UInt32, isUp: Bool, name: String)] = [
+    (0x0C, 0x6F, true, "Consumer/DisplayBrightnessIncrement"),
+    (0x0C, 0x70, false, "Consumer/DisplayBrightnessDecrement"),
+    (0xFF, 0x20, true, "AppleVendorTopCase/BrightnessUp"),
+    (0xFF, 0x21, false, "AppleVendorTopCase/BrightnessDown"),
+    (0xFF01, 0x20, true, "AppleVendorKeyboard/BrightnessUp"),
+    (0xFF01, 0x21, false, "AppleVendorKeyboard/BrightnessDown"),
+  ]
+
+  func start() {
+    guard !self.isRunning else {
+      return
+    }
+    let access = IOHIDCheckAccess(.listenEvent)
+    guard access == .granted else {
+      if !self.accessRequested {
+        self.accessRequested = true
+        os_log("Input Monitoring is not granted yet (state %{public}@). Requesting it so the brightness keys can be read from the keyboard directly; grant it in System Settings > Privacy & Security > Input Monitoring.", type: .default, String(access.rawValue))
+        _ = IOHIDRequestAccess(.listenEvent)
+      }
+      return
+    }
+    let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    IOHIDManagerSetDeviceMatching(manager, nil) // all devices, the element matching below limits what we receive
+    let inputMatching: [[String: Int]] = self.brightnessUsages.map { [kIOHIDElementUsagePageKey: Int($0.page), kIOHIDElementUsageKey: Int($0.usage)] }
+    IOHIDManagerSetInputValueMatchingMultiple(manager, inputMatching as CFArray)
+    IOHIDManagerRegisterInputValueCallback(manager, { _, _, _, value in
+      HIDBrightnessKeyListener.shared.handle(value: value)
+    }, nil)
+    IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+    let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    guard result == kIOReturnSuccess else {
+      os_log("Could not open the HID manager for the brightness keys (IOReturn 0x%{public}@)", type: .error, String(UInt32(bitPattern: result), radix: 16))
+      IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+      return
+    }
+    self.manager = manager
+    self.isRunning = true
+    os_log("Listening for the brightness keys directly on the keyboard (HID)", type: .default)
+  }
+
+  func stop() {
+    guard let manager = self.manager else {
+      return
+    }
+    IOHIDManagerRegisterInputValueCallback(manager, nil, nil)
+    IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+    IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    self.manager = nil
+    self.isRunning = false
+    os_log("Stopped listening for the brightness keys on the keyboard (HID)", type: .default)
+  }
+
+  private func handle(value: IOHIDValue) {
+    let element = IOHIDValueGetElement(value)
+    let page = IOHIDElementGetUsagePage(element)
+    let usage = IOHIDElementGetUsage(element)
+    guard let match = self.brightnessUsages.first(where: { $0.page == page && $0.usage == usage }) else {
+      return
+    }
+    let pressed = IOHIDValueGetIntegerValue(value) != 0
+    os_log("HID brightness key %{public}@ %{public}@", type: .default, match.name, pressed ? "pressed" : "released")
+    guard pressed else {
+      return
+    }
+    let isUp = match.isUp
+    DispatchQueue.main.async {
+      app.mediaKeyTap.handleBrightnessKeyFromHID(isUp: isUp)
+    }
   }
 }
