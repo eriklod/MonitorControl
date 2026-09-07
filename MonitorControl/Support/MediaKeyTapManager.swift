@@ -443,14 +443,14 @@ class HIDBrightnessKeyListener {
     // "brightness" normally happens in the system's keyboard driver, which is exactly the step that is skipped with the
     // lid closed. So listen to those raw keys too and do the translation ourselves. Whole media key pages are matched so
     // that whatever a keyboard sends for its brightness keys ends up in the log.
-    let inputMatching: [[String: Int]] = [
-      [kIOHIDElementUsagePageKey: Int(self.pageKeyboard), kIOHIDElementUsageKey: Int(self.usageF1)],
-      [kIOHIDElementUsagePageKey: Int(self.pageKeyboard), kIOHIDElementUsageKey: Int(self.usageF2)],
-      [kIOHIDElementUsagePageKey: Int(self.pageConsumer)],
-      [kIOHIDElementUsagePageKey: Int(self.pageAppleVendorTopCase)],
-      [kIOHIDElementUsagePageKey: Int(self.pageAppleVendorKeyboard)],
-    ]
-    IOHIDManagerSetInputValueMatchingMultiple(manager, inputMatching as CFArray)
+    // No input matching on purpose: the filtering happens in handle(value:) so that nothing is silently dropped by the
+    // system and every keyboard-like device announces itself in the log.
+    IOHIDManagerRegisterDeviceMatchingCallback(manager, { _, _, _, device in
+      HIDBrightnessKeyListener.shared.logDevice(device, arrived: true)
+    }, nil)
+    IOHIDManagerRegisterDeviceRemovalCallback(manager, { _, _, _, device in
+      HIDBrightnessKeyListener.shared.logDevice(device, arrived: false)
+    }, nil)
     IOHIDManagerRegisterInputValueCallback(manager, { _, _, _, value in
       HIDBrightnessKeyListener.shared.handle(value: value)
     }, nil)
@@ -488,11 +488,42 @@ class HIDBrightnessKeyListener {
     return false
   }
 
+  private var devicesSeenSendingInput: Set<String> = []
+
+  private func deviceDescription(_ device: IOHIDDevice) -> String {
+    let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "?"
+    let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int ?? 0
+    let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int ?? 0
+    let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String ?? "?"
+    let primaryPage = IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsagePageKey as CFString) as? Int ?? 0
+    let primaryUsage = IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsageKey as CFString) as? Int ?? 0
+    var pairs = ""
+    if let usagePairs = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString) as? [[String: Int]] {
+      pairs = usagePairs.map { String(format: "%X:%X", $0[kIOHIDDeviceUsagePageKey] ?? 0, $0[kIOHIDDeviceUsageKey] ?? 0) }.joined(separator: " ")
+    }
+    return "\(product) (vendor 0x\(String(vendorID, radix: 16)) product 0x\(String(productID, radix: 16)) transport \(transport) primary \(String(primaryPage, radix: 16)):\(String(primaryUsage, radix: 16)) usage pairs [\(pairs)])"
+  }
+
+  fileprivate func logDevice(_ device: IOHIDDevice, arrived: Bool) {
+    os_log("HID device %{public}@: %{public}@", type: .default, arrived ? "found" : "removed", self.deviceDescription(device))
+  }
+
   private func handle(value: IOHIDValue) {
     let element = IOHIDValueGetElement(value)
     let page = IOHIDElementGetUsagePage(element)
     let usage = IOHIDElementGetUsage(element)
     let pressed = IOHIDValueGetIntegerValue(value) != 0
+    let elementDevice: IOHIDDevice? = IOHIDElementGetDevice(element)
+    if let device = elementDevice {
+      let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "?"
+      if !self.devicesSeenSendingInput.contains(product) {
+        self.devicesSeenSendingInput.insert(product)
+        os_log("HID input is arriving from %{public}@", type: .default, product)
+      }
+    }
+    guard page == self.pageKeyboard || page == self.pageConsumer || page == self.pageAppleVendorTopCase || page == self.pageAppleVendorKeyboard else {
+      return
+    }
     if page == self.pageAppleVendorTopCase, usage == self.usageTopCaseFn {
       self.fnKeyPressed = pressed
       return
