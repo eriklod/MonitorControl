@@ -417,12 +417,12 @@ class HIDBrightnessKeyListener {
     guard !self.isRunning else {
       return
     }
-    let access = IOHIDCheckAccess(.listenEvent)
-    guard access == .granted else {
+    let access = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+    guard access == kIOHIDAccessTypeGranted else {
       if !self.accessRequested {
         self.accessRequested = true
         os_log("Input Monitoring is not granted yet (state %{public}@). Requesting it so the brightness keys can be read from the keyboard directly; grant it in System Settings > Privacy & Security > Input Monitoring.", type: .default, String(access.rawValue))
-        _ = IOHIDRequestAccess(.listenEvent)
+        _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
       }
       return
     }
