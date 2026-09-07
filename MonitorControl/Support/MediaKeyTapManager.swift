@@ -438,7 +438,13 @@ class HIDBrightnessKeyListener {
       }
     }
     let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-    IOHIDManagerSetDeviceMatching(manager, nil) // all devices, the element matching below limits what we receive
+    // Keyboards and consumer control (media key) devices only. Opening every HID device in the system is not needed and
+    // some of the internal ones refuse to be opened.
+    let deviceMatching: [[String: Int]] = [
+      [kIOHIDDeviceUsagePageKey: Int(kHIDPage_GenericDesktop), kIOHIDDeviceUsageKey: Int(kHIDUsage_GD_Keyboard)],
+      [kIOHIDDeviceUsagePageKey: Int(kHIDPage_Consumer), kIOHIDDeviceUsageKey: Int(kHIDUsage_Csmr_ConsumerControl)],
+    ]
+    IOHIDManagerSetDeviceMatchingMultiple(manager, deviceMatching as CFArray)
     // Apple's built-in keyboards report F1/F2 as plain function keys plus the state of the fn key; the translation to
     // "brightness" normally happens in the system's keyboard driver, which is exactly the step that is skipped with the
     // lid closed. So listen to those raw keys too and do the translation ourselves. Whole media key pages are matched so
@@ -464,6 +470,7 @@ class HIDBrightnessKeyListener {
     self.manager = manager
     self.isRunning = true
     os_log("Listening for the brightness keys directly on the keyboard (HID); F1/F2 as standard function keys: %{public}@", type: .default, String(self.functionKeysAreStandard()))
+    HIDEventSystemMonitor.shared.start()
   }
 
   func stop() {
@@ -518,9 +525,14 @@ class HIDBrightnessKeyListener {
       let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "?"
       if !self.devicesSeenSendingInput.contains(product) {
         self.devicesSeenSendingInput.insert(product)
-        os_log("HID input is arriving from %{public}@", type: .default, product)
+        os_log("HID input is arriving from %{public}@ (IOHIDManager)", type: .default, product)
       }
     }
+    self.process(page: page, usage: usage, pressed: pressed, source: "IOHIDManager")
+  }
+
+  // Shared by the IOHIDManager path and the HID event system path (HIDEventSystemMonitor).
+  func process(page: UInt32, usage: UInt32, pressed: Bool, source: String) {
     guard page == self.pageKeyboard || page == self.pageConsumer || page == self.pageAppleVendorTopCase || page == self.pageAppleVendorKeyboard else {
       return
     }
@@ -534,7 +546,7 @@ class HIDBrightnessKeyListener {
       }
       // Without "standard function keys" a bare F1 means brightness and fn+F1 means F1; with the setting it is the other way round.
       let isBrightnessKey = self.fnKeyPressed == self.functionKeysAreStandard()
-      os_log("HID key %{public}@ %{public}@ (fn held: %{public}@) -> %{public}@", type: .default, usage == self.usageF1 ? "F1" : "F2", pressed ? "pressed" : "released", String(self.fnKeyPressed), isBrightnessKey ? "brightness" : "plain function key, ignored")
+      os_log("HID key %{public}@ %{public}@ via %{public}@ (fn held: %{public}@) -> %{public}@", type: .default, usage == self.usageF1 ? "F1" : "F2", pressed ? "pressed" : "released", source, String(self.fnKeyPressed), isBrightnessKey ? "brightness" : "plain function key, ignored")
       guard pressed, isBrightnessKey else {
         return
       }
@@ -543,7 +555,7 @@ class HIDBrightnessKeyListener {
     }
     // Consumer and Apple vendor pages: log everything (these pages only carry media/function keys), act on the brightness ones.
     let match = self.directBrightnessUsages.first(where: { $0.page == page && $0.usage == usage })
-    os_log("HID media key usage page 0x%{public}@ usage 0x%{public}@ %{public}@%{public}@", type: .default, String(page, radix: 16), String(usage, radix: 16), pressed ? "pressed" : "released", match.map { " (" + $0.name + ")" } ?? "")
+    os_log("HID media key usage page 0x%{public}@ usage 0x%{public}@ %{public}@ via %{public}@%{public}@", type: .default, String(page, radix: 16), String(usage, radix: 16), pressed ? "pressed" : "released", source, match.map { " (" + $0.name + ")" } ?? "")
     guard pressed, let brightness = match else {
       return
     }
@@ -554,5 +566,85 @@ class HIDBrightnessKeyListener {
     DispatchQueue.main.async {
       app.mediaKeyTap.handleBrightnessKeyFromHID(isUp: isUp)
     }
+  }
+}
+
+// Second way of reading the keys: the HID event system, one level above the raw device reports. This is the layer that
+// `hidutil monitor` uses and it sees every keyboard, including Bluetooth ones on Apple Silicon. The functions are not part
+// of the public SDK, so they are looked up at runtime and everything is skipped if they are missing.
+class HIDEventSystemMonitor {
+  static let shared = HIDEventSystemMonitor()
+
+  private typealias CreateWithTypeFn = @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
+  private typealias EventCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
+  private typealias RegisterEventCallbackFn = @convention(c) (UnsafeMutableRawPointer?, EventCallback, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
+  private typealias ScheduleWithRunLoopFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
+  private typealias EventGetTypeFn = @convention(c) (UnsafeMutableRawPointer?) -> UInt32
+  private typealias EventGetIntegerValueFn = @convention(c) (UnsafeMutableRawPointer?, UInt32) -> Int
+
+  private static let clientTypeMonitor: Int32 = 1
+  private static let eventTypeKeyboard: UInt32 = 3
+  private static let fieldKeyboardUsagePage: UInt32 = 3 << 16
+  private static let fieldKeyboardUsage: UInt32 = (3 << 16) | 1
+  private static let fieldKeyboardDown: UInt32 = (3 << 16) | 2
+
+  private static var eventGetType: EventGetTypeFn?
+  private static var eventGetIntegerValue: EventGetIntegerValueFn?
+  private static var loggedFirstEvent = false
+
+  private var client: UnsafeMutableRawPointer?
+
+  func start() {
+    guard self.client == nil else {
+      return
+    }
+    guard let handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW) else {
+      os_log("HID event system: IOKit could not be loaded", type: .error)
+      return
+    }
+    guard let createSymbol = dlsym(handle, "IOHIDEventSystemClientCreateWithType"),
+          let registerSymbol = dlsym(handle, "IOHIDEventSystemClientRegisterEventCallback"),
+          let scheduleSymbol = dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop"),
+          let getTypeSymbol = dlsym(handle, "IOHIDEventGetType"),
+          let getIntegerSymbol = dlsym(handle, "IOHIDEventGetIntegerValue")
+    else {
+      os_log("HID event system: functions not available on this macOS version, skipping", type: .default)
+      return
+    }
+    let create = unsafeBitCast(createSymbol, to: CreateWithTypeFn.self)
+    let register = unsafeBitCast(registerSymbol, to: RegisterEventCallbackFn.self)
+    let schedule = unsafeBitCast(scheduleSymbol, to: ScheduleWithRunLoopFn.self)
+    HIDEventSystemMonitor.eventGetType = unsafeBitCast(getTypeSymbol, to: EventGetTypeFn.self)
+    HIDEventSystemMonitor.eventGetIntegerValue = unsafeBitCast(getIntegerSymbol, to: EventGetIntegerValueFn.self)
+    guard let client = create(nil, HIDEventSystemMonitor.clientTypeMonitor, nil) else {
+      os_log("HID event system: monitor client could not be created (Input Monitoring permission?)", type: .error)
+      return
+    }
+    let callback: EventCallback = { _, _, _, event in
+      HIDEventSystemMonitor.handle(event: event)
+    }
+    register(client, callback, nil, nil)
+    let runLoop = Unmanaged.passUnretained(CFRunLoopGetMain()).toOpaque()
+    let mode = Unmanaged.passUnretained(CFRunLoopMode.commonModes.rawValue).toOpaque()
+    schedule(client, runLoop, mode)
+    self.client = client
+    os_log("HID event system monitor started", type: .default)
+  }
+
+  private static func handle(event: UnsafeMutableRawPointer?) {
+    guard let event = event, let getType = HIDEventSystemMonitor.eventGetType, let getInteger = HIDEventSystemMonitor.eventGetIntegerValue else {
+      return
+    }
+    if !HIDEventSystemMonitor.loggedFirstEvent {
+      HIDEventSystemMonitor.loggedFirstEvent = true
+      os_log("HID input is arriving (HID event system)", type: .default)
+    }
+    guard getType(event) == HIDEventSystemMonitor.eventTypeKeyboard else {
+      return
+    }
+    let page = UInt32(truncatingIfNeeded: getInteger(event, HIDEventSystemMonitor.fieldKeyboardUsagePage))
+    let usage = UInt32(truncatingIfNeeded: getInteger(event, HIDEventSystemMonitor.fieldKeyboardUsage))
+    let pressed = getInteger(event, HIDEventSystemMonitor.fieldKeyboardDown) != 0
+    HIDBrightnessKeyListener.shared.process(page: page, usage: usage, pressed: pressed, source: "HID event system")
   }
 }
