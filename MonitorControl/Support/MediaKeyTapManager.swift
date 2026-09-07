@@ -13,6 +13,7 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
   var lastMediaKeyEventTime: CFTimeInterval = 0 // used by the tap watchdog to avoid re-registering the tap while keys are in use
   var watchedKeys: [MediaKey] = [] // the keys the current tap was started with
   var lastBrightnessKeyPressTime: CFTimeInterval = 0 // de-duplicates a brightness key press that arrives via both the event tap and HID
+  var lastBrightnessKeyPressSource: String = "" // "tap" or "hid": only a press from the *other* source within the window is a duplicate
   let brightnessKeyDuplicateWindow: CFTimeInterval = 0.25
 
   // Delegate entry point for key events delivered by the event tap.
@@ -25,11 +26,12 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
       // is what tells us whether a key press reached the app at all when a user reports "the keys do nothing".
       os_log("Media key %{public}@ received (sleepID %{public}@, reconfigureID %{public}@)", type: .default, String(describing: mediaKey), String(app.sleepID), String(app.reconfigureID))
       if [.brightnessUp, .brightnessDown].contains(mediaKey) {
-        if CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
+        if self.lastBrightnessKeyPressSource == "hid", CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
           os_log("- ignored, the same press was already handled via HID", type: .default)
           return
         }
         self.lastBrightnessKeyPressTime = CACurrentMediaTime()
+        self.lastBrightnessKeyPressSource = "tap"
       }
     }
     self.processMediaKey(mediaKey: mediaKey, event: event, modifiers: modifiers)
@@ -43,11 +45,12 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
       return // brightness media keys are disabled or currently disengaged (no external display, sleep, reconfiguration)
     }
     self.lastMediaKeyEventTime = CACurrentMediaTime()
-    if CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
+    if self.lastBrightnessKeyPressSource == "tap", CACurrentMediaTime() - self.lastBrightnessKeyPressTime < self.brightnessKeyDuplicateWindow {
       os_log("Brightness key %{public}@ via HID ignored, the same press was already handled via the event tap", type: .default, isUp ? "up" : "down")
       return
     }
     self.lastBrightnessKeyPressTime = CACurrentMediaTime()
+    self.lastBrightnessKeyPressSource = "hid"
     os_log("Media key %{public}@ received via HID (sleepID %{public}@, reconfigureID %{public}@)", type: .default, isUp ? "brightnessUp" : "brightnessDown", String(app.sleepID), String(app.reconfigureID))
     self.processMediaKey(mediaKey: isUp ? .brightnessUp : .brightnessDown, event: nil, modifiers: NSEvent.modifierFlags)
   }
