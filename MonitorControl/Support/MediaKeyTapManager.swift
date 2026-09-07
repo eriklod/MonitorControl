@@ -222,7 +222,84 @@ class MediaKeyTapManager: MediaKeyTapDelegate {
       self.mediaKeyTap = MediaKeyTap(delegate: self, on: KeyPressMode.keyDownAndUp, for: keys, observeBuiltIn: true)
       self.mediaKeyTap?.start()
     }
-    os_log("Media key tap registered for: %{public}@", type: .default, keys.isEmpty ? "nothing (tap not active)" : keys.map { String(describing: $0) }.joined(separator: ", "))
+    os_log("Media key tap registered for: %{public}@ (Accessibility trusted: %{public}@)", type: .default, keys.isEmpty ? "nothing (tap not active)" : keys.map { String(describing: $0) }.joined(separator: ", "), String(AXIsProcessTrusted()))
+    self.startDiagnosticTap(active: !keys.isEmpty)
+  }
+
+  // MARK: - Diagnostic event tap
+
+  // A second, listen-only tap that never consumes anything. It exists purely to answer two questions in the log when the
+  // keys "do nothing": can this process create an event tap at all (if not, the Accessibility permission is not effective
+  // despite what System Settings shows), and which events do the brightness keys actually generate on this machine.
+  // Only media key related events are ever logged, regular typing is ignored.
+  static var diagnosticTapPort: CFMachPort?
+  static var diagnosticTapRunLoopSource: CFRunLoopSource?
+
+  func startDiagnosticTap(active: Bool) {
+    self.stopDiagnosticTap()
+    guard active else {
+      return
+    }
+    let mask = CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << NX_SYSDEFINED)
+    let callback: CGEventTapCallBack = { _, type, event, _ in
+      MediaKeyTapManager.logDiagnosticEvent(type: type, event: event)
+      return Unmanaged.passUnretained(event)
+    }
+    guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: mask, callback: callback, userInfo: nil) else {
+      os_log("Diagnostic event tap could NOT be created. macOS refuses event taps for this process, so the media key tap cannot work either. Accessibility trusted: %{public}@. Remove MonitorControl from System Settings > Privacy & Security > Accessibility (and Input Monitoring, if listed) and add it again.", type: .error, String(AXIsProcessTrusted()))
+      return
+    }
+    guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else {
+      os_log("Diagnostic event tap: run loop source could not be created", type: .error)
+      return
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    CGEvent.tapEnable(tap: port, enable: true)
+    MediaKeyTapManager.diagnosticTapPort = port
+    MediaKeyTapManager.diagnosticTapRunLoopSource = source
+    os_log("Diagnostic event tap created, listening for media key events", type: .default)
+  }
+
+  func stopDiagnosticTap() {
+    if let source = MediaKeyTapManager.diagnosticTapRunLoopSource {
+      CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+      CFRunLoopSourceInvalidate(source)
+    }
+    if let port = MediaKeyTapManager.diagnosticTapPort {
+      CGEvent.tapEnable(tap: port, enable: false)
+      CFMachPortInvalidate(port)
+    }
+    MediaKeyTapManager.diagnosticTapRunLoopSource = nil
+    MediaKeyTapManager.diagnosticTapPort = nil
+  }
+
+  static func logDiagnosticEvent(type: CGEventType, event: CGEvent) {
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+      os_log("Diagnostic event tap was disabled by the system (%{public}@), re-enabling", type: .default, type == .tapDisabledByTimeout ? "timeout" : "user input")
+      if let port = MediaKeyTapManager.diagnosticTapPort {
+        CGEvent.tapEnable(tap: port, enable: true)
+      }
+      return
+    }
+    if type == .keyDown {
+      let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+      let names: [Int64: String] = [144: "brightness up (function key code 144)", 145: "brightness down (function key code 145)", 107: "F14", 113: "F15", 122: "F1", 120: "F2"]
+      if let name = names[keycode] {
+        os_log("Diagnostic event tap: keyDown %{public}@, flags %{public}@", type: .default, name, String(event.flags.rawValue, radix: 16))
+      }
+      return
+    }
+    guard type.rawValue == UInt32(NX_SYSDEFINED), let nsEvent = NSEvent(cgEvent: event), nsEvent.subtype.rawValue == 8 else {
+      return
+    }
+    let keycode = Int32((nsEvent.data1 & 0xFFFF_0000) >> 16)
+    let keyFlags = nsEvent.data1 & 0x0000_FFFF
+    let pressed = ((keyFlags & 0xFF00) >> 8) == 0xA
+    let names: [Int32: String] = [NX_KEYTYPE_BRIGHTNESS_UP: "brightness up", NX_KEYTYPE_BRIGHTNESS_DOWN: "brightness down", NX_KEYTYPE_SOUND_UP: "volume up", NX_KEYTYPE_SOUND_DOWN: "volume down", NX_KEYTYPE_MUTE: "mute", NX_KEYTYPE_ILLUMINATION_UP: "keyboard illumination up", NX_KEYTYPE_ILLUMINATION_DOWN: "keyboard illumination down"]
+    guard let name = names[keycode] else {
+      return
+    }
+    os_log("Diagnostic event tap: system-defined media key %{public}@ (code %{public}@) %{public}@", type: .default, name, String(keycode), pressed ? "pressed" : "released")
   }
 
   // Re-register the tap so that it is in front of any event tap another process registered in the meantime. macOS delivers
